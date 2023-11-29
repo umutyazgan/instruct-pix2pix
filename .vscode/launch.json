@@ -1,0 +1,53 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: edit_cli.py",
+            "type": "python",
+            "request": "launch",
+            "program": "edit_cli.py",
+            "args": [
+                "--resolution",
+                "384",
+                "--input",
+                "../examples/example.png",
+                "--output",
+                "../examples/result.png",
+                "--edit",
+                "",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "Python: predict_noise.py",
+            "type": "python",
+            "request": "launch",
+            "program": "predict_noise.py",
+            "args": [
+                // "--resolution",
+                // "256",
+                "--input",
+                "example.png",
+                // "--noisy",
+                // "../examples/noisy_encoded_image.pth",
+                "--output",
+                "result_wys.png",
+                "--edit",
+                "Add glasses",
+                "--steps",
+                "100"
+            ],
+            // "env": {
+            //     "HIP_VISIBLE_DEVICES": "0",
+            //     "PYTORCH_ROCM_ARCH": "gfx1100",
+            //     "CMAKE_PREFIX_PATH": "/SD/stable-diffusion-webui/venv/"
+            // },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
