@@ -728,6 +728,7 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
+        # print("h.shape: ", h.shape)
         for module in self.input_blocks:
             h = module(h, emb, context)
             hs.append(h)

@@ -23,7 +23,7 @@ from stable_diffusion.ldm.util import instantiate_from_config
 class CFGDenoiser(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.inner_model = model
+        self.inner_model = model  # UNet
 
     def forward(self, z, sigma, cond, uncond, text_cfg_scale, image_cfg_scale):
         cfg_z = einops.repeat(z, "1 ... -> n ...", n=3)
@@ -36,6 +36,19 @@ class CFGDenoiser(nn.Module):
         out_cond, out_img_cond, out_uncond = self.inner_model(cfg_z, cfg_sigma, cond=cfg_cond).chunk(3)
         return out_uncond + text_cfg_scale * (out_cond - out_img_cond) + image_cfg_scale * (out_img_cond - out_uncond)
 
+
+@torch.no_grad()
+def unet_single_pass(
+    model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, mask=None, z_0=None, sigma_level=None
+):
+    """
+    """
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+
+    denoised = model(x, sigmas[sigma_level] * s_in, **extra_args)  # mask unaware prediction
+
+    return denoised
 
 # model = CompVisDenoiser
 def predict_noise(model, z, sigma, cond):
@@ -151,32 +164,37 @@ def main():
             "image_cfg_scale": args.cfg_image,
         }
 
-        torch.manual_seed(seed)
+        torch.manual_seed(0)
 
-        # ## TESTING
-        # noise = torch.randn_like(input_image)
-        # noisy_image = input_image + noise * K.utils.append_dims(sigmas[0], input_image.ndim)
-
-        # noisy_image = torch.clamp((noisy_image.to(device="cuda") + 1.0) / 2.0, min=0.0, max=1.0)
-        # noisy_image = 255.0 * rearrange(noisy_image, "1 c h w -> h w c")
-        # noisy_image = Image.fromarray(noisy_image.type(torch.uint8).cpu().numpy())
-        # noisy_image.save("noisy_image_0.png")
-        # ## TESTING
-
-
-        # 0.8 noise + 0.2 image
         # TODO Figure out how to get the actual noised image at step t, rather than giving an arbitrary amount of noise
-        sigma_level = 20 # NOTE small number means more noise
+        sigma_level = 10 # NOTE small number means more noise
         noise = torch.randn_like(encoded_input_image)
-        encoded_noisy_image = encoded_input_image + noise * K.utils.append_dims(sigmas[sigma_level], encoded_input_image.ndim)
+        noisy_latent = encoded_input_image + noise * K.utils.append_dims(sigmas[sigma_level], encoded_input_image.ndim)
+        # NOTE maybe we need to multiply with sigma[0] to sigma[20] or sigma[20] to sigma[100], instad of just multiplying with simga[20]
 
         # NOTE why multiply with sigmas[0]?
-        z = encoded_noisy_image# * sigmas[0]
+        z = noisy_latent# * sigmas[0]
 
-        eps = predict_noise(model_wrap, z, torch.Tensor([sigmas[sigma_level]]).to(device="cuda"), cond)
-        eps_no_text = predict_noise(model_wrap, z, torch.Tensor([sigmas[sigma_level]]).to(device="cuda"), cond_no_text)
+        # eps = predict_noise(model_wrap, z, torch.Tensor([sigmas[sigma_level]]).to(device="cuda"), cond)
+        # eps_no_text = predict_noise(model_wrap, z, torch.Tensor([sigmas[sigma_level]]).to(device="cuda"), cond_no_text)
+        print(sigmas[sigma_level:].shape)
+        # denoised_latent = K.sampling.sample_euler_ancestral(model_wrap_cfg, noisy_latent, sigmas[sigma_level:], extra_args=extra_args)
+        denoised_latent = unet_single_pass(model_wrap_cfg, noisy_latent, sigmas, extra_args=extra_args, sigma_level=sigma_level)
+        predicted_noise = noisy_latent - denoised_latent
+        # denoised_latent_no_text = K.sampling.sample_euler_ancestral(model_wrap_cfg, noisy_latent, sigmas[sigma_level:], extra_args=extra_args_no_text)
+        denoised_latent_no_text = unet_single_pass(model_wrap_cfg, noisy_latent, sigmas, extra_args=extra_args_no_text, sigma_level=sigma_level)
+        predicted_noise_no_text = noisy_latent - denoised_latent_no_text
 
-        relevance_map = torch.abs(eps - eps_no_text)
+        relevance_map = torch.abs(predicted_noise - predicted_noise_no_text)
+
+        x = model.decode_first_stage(relevance_map)
+
+        x = torch.clamp((x + 1.0) / 2.0, min=0.0, max=1.0)
+        x = 255.0 * rearrange(x, "1 c h w -> h w c")
+        x = Image.fromarray(x.type(torch.uint8).cpu().numpy())
+
+        x.save("relevance_maps/normalized_single_pass/relevance_map.png")
+
         q1 = np.percentile(relevance_map.cpu(), 25)
         q3 = np.percentile(relevance_map.cpu(), 75)
         iqr = q3 - q1
@@ -194,7 +212,7 @@ def main():
 
         # Denoising stage
         z = noise
-        z = K.sampling.sample_euler_ancestral(model_wrap_cfg, z, sigmas, extra_args=extra_args, mask=edit_mask, input=encoded_input_image)
+        z = K.sampling.sample_euler_ancestral(model_wrap_cfg, z, sigmas, extra_args=extra_args, mask=edit_mask, z_0=encoded_input_image)
 
         x = model.decode_first_stage(z)
 

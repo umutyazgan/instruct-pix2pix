@@ -303,6 +303,7 @@ class DDPM(pl.LightningModule):
         return self.p_sample_loop((batch_size, channels, image_size, image_size),
                                   return_intermediates=return_intermediates)
 
+    # NOTE This may be the method that adds noise to a given image for t steps
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
@@ -838,6 +839,7 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def encode_first_stage(self, x):
         if hasattr(self, "split_input_params"):
+            print("split_input_params set")
             if self.split_input_params["patch_distributed_vq"]:
                 ks = self.split_input_params["ks"]  # eg. (128, 128)
                 stride = self.split_input_params["stride"]  # eg. (64, 64)
@@ -872,8 +874,9 @@ class LatentDiffusion(DDPM):
 
             else:
                 return self.first_stage_model.encode(x)
-        else:
+        else: # NOTE this first_stage_model is AutoencoderKL
             return self.first_stage_model.encode(x)
+            # NOTE .encode() here returns DiagonalGaussianDistribution(moments)
 
     def shared_step(self, batch, **kwargs):
         x, c = self.get_input(batch, self.first_stage_key)
@@ -881,6 +884,7 @@ class LatentDiffusion(DDPM):
         return loss
 
     def forward(self, x, c, *args, **kwargs):
+        print("FORWARD")
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
@@ -997,13 +1001,14 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond)
+            x_recon = self.model(x_noisy, t, **cond) # DiffusionWrapper / UNet
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
         else:
             return x_recon
 
+    # NOTE This may be the noise predictor
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
         return (extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - pred_xstart) / \
                extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)

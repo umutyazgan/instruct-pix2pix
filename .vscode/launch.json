@@ -28,8 +28,8 @@
             "request": "launch",
             "program": "predict_noise.py",
             "args": [
-                // "--resolution",
-                // "256",
+                "--resolution",
+                "384",
                 "--input",
                 "example.png",
                 // "--noisy",
@@ -37,15 +37,10 @@
                 "--output",
                 "result_wys.png",
                 "--edit",
-                "Add glasses",
+                "Add glasses to its eyes",
                 "--steps",
                 "100"
             ],
-            // "env": {
-            //     "HIP_VISIBLE_DEVICES": "0",
-            //     "PYTORCH_ROCM_ARCH": "gfx1100",
-            //     "CMAKE_PREFIX_PATH": "/SD/stable-diffusion-webui/venv/"
-            // },
             "console": "integratedTerminal",
             "justMyCode": false
         }
