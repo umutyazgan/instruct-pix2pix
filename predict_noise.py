@@ -80,6 +80,42 @@ def load_model_from_config(config, ckpt, vae_ckpt=None, verbose=False):
         print(u)
     return model
 
+def get_binary_mask(model, rm):
+    decoded_relevance_map = model.decode_first_stage(rm)
+    decoded_relevance_map = 255 * rearrange(decoded_relevance_map, "1 c h w -> h w c")
+
+    q1 = np.percentile(decoded_relevance_map.cpu(), 25)
+    q3 = np.percentile(decoded_relevance_map.cpu(), 75)
+    iqr = q3 - q1
+
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+
+    clamped_relevance_map = np.clip(decoded_relevance_map.cpu(), lower_bound, upper_bound)
+
+    normalized_relevance_map = (
+        clamped_relevance_map - torch.min(clamped_relevance_map)
+        ) / (
+            torch.max(clamped_relevance_map) - torch.min(clamped_relevance_map)
+            )
+    edit_mask = normalized_relevance_map
+    edit_mask[normalized_relevance_map > 0.3] = 1.
+    edit_mask[normalized_relevance_map <= 0.3] = 0.
+    #edit_mask = edit_mask.to("cuda")
+    return edit_mask
+
+
+def get_relevance_map(model_wrap_cfg, z, sigmas, sigma_level, extra_args, extra_args_no_text):
+    denoised_latent = unet_single_pass(model_wrap_cfg, z, sigmas, extra_args=extra_args, sigma_level=sigma_level)
+    predicted_noise = z - denoised_latent
+    denoised_latent_no_text = unet_single_pass(model_wrap_cfg, z, sigmas, extra_args=extra_args_no_text, sigma_level=sigma_level)
+    predicted_noise_no_text = z - denoised_latent_no_text
+
+    relevance_map = torch.abs(predicted_noise - predicted_noise_no_text)
+    return relevance_map
+
+
+
 
 def main():
     parser = ArgumentParser()
@@ -174,41 +210,29 @@ def main():
 
         # NOTE why multiply with sigmas[0]?
         z = noisy_latent# * sigmas[0]
+        relevance_map = get_relevance_map(model_wrap_cfg, z, sigmas, 10, extra_args, extra_args_no_text)
+        edit_mask = get_binary_mask(model, relevance_map)
+        # TODO: Find out if/why edit mask is all 1 or all 0
+        edit_mask_channel_1 = edit_mask[:,:,0]
+        edit_mask_channel_2 = edit_mask[:,:,1]
+        edit_mask_channel_3 = edit_mask[:,:,2]
+        print(edit_mask_channel_1.shape)
+        print(edit_mask_channel_2.shape)
+        print(edit_mask_channel_3.shape)
 
-        # eps = predict_noise(model_wrap, z, torch.Tensor([sigmas[sigma_level]]).to(device="cuda"), cond)
-        # eps_no_text = predict_noise(model_wrap, z, torch.Tensor([sigmas[sigma_level]]).to(device="cuda"), cond_no_text)
-        print(sigmas[sigma_level:].shape)
-        # denoised_latent = K.sampling.sample_euler_ancestral(model_wrap_cfg, noisy_latent, sigmas[sigma_level:], extra_args=extra_args)
-        denoised_latent = unet_single_pass(model_wrap_cfg, noisy_latent, sigmas, extra_args=extra_args, sigma_level=sigma_level)
-        predicted_noise = noisy_latent - denoised_latent
-        # denoised_latent_no_text = K.sampling.sample_euler_ancestral(model_wrap_cfg, noisy_latent, sigmas[sigma_level:], extra_args=extra_args_no_text)
-        denoised_latent_no_text = unet_single_pass(model_wrap_cfg, noisy_latent, sigmas, extra_args=extra_args_no_text, sigma_level=sigma_level)
-        predicted_noise_no_text = noisy_latent - denoised_latent_no_text
+        # print(squashed_mask.shape)
 
-        relevance_map = torch.abs(predicted_noise - predicted_noise_no_text)
+        # x = torch.clamp((edit_mask + 1.0) / 2.0, min=0.0, max=1.0)
+        # x = 255.0 * rearrange(edit_mask, "1 c h w -> h w c")
+        # x = Image.fromarray(edit_mask.type(torch.uint8).cpu().numpy())
+        # TODO try doing this before decoding again, check pixel values after decode
+        img1 = Image.fromarray(255*np.uint8(edit_mask_channel_1), 'L')
+        img2 = Image.fromarray(255*np.uint8(edit_mask_channel_2), 'L')
+        img3 = Image.fromarray(255*np.uint8(edit_mask_channel_3), 'L')
 
-        x = model.decode_first_stage(relevance_map)
-
-        x = torch.clamp((x + 1.0) / 2.0, min=0.0, max=1.0)
-        x = 255.0 * rearrange(x, "1 c h w -> h w c")
-        x = Image.fromarray(x.type(torch.uint8).cpu().numpy())
-
-        x.save("relevance_maps/normalized_single_pass/relevance_map.png")
-
-        q1 = np.percentile(relevance_map.cpu(), 25)
-        q3 = np.percentile(relevance_map.cpu(), 75)
-        iqr = q3 - q1
-
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-
-        clamped_relevance_map = np.clip(relevance_map.cpu(), lower_bound, upper_bound)
-
-        normalized_relevance_map = (clamped_relevance_map - torch.min(clamped_relevance_map)) / (torch.max(clamped_relevance_map) - torch.min(clamped_relevance_map))
-        edit_mask = normalized_relevance_map
-        edit_mask[edit_mask > 0.5] = 1
-        edit_mask[edit_mask <= 0.5] = 0
-        edit_mask = edit_mask.to("cuda")
+        img1.save("relevance_maps/normalized_single_pass/decoded_before_iqr_binary_1.png")
+        img2.save("relevance_maps/normalized_single_pass/decoded_before_iqr_binary_2.png")
+        img3.save("relevance_maps/normalized_single_pass/decoded_before_iqr_binary_3.png")
 
         # Denoising stage
         z = noise
