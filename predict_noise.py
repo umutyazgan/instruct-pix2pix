@@ -38,24 +38,19 @@ class CFGDenoiser(nn.Module):
 
 
 @torch.no_grad()
-def unet_single_pass(
-    model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, mask=None, z_0=None, sigma_level=None
-):
+def unet_single_pass(model, x, sigmas, extra_args=None, sigma_level=None):
     """
     """
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
-
     denoised = model(x, sigmas[sigma_level] * s_in, **extra_args)  # mask unaware prediction
-
     return denoised
 
-# model = CompVisDenoiser
-def predict_noise(model, z, sigma, cond):
-    t = model.sigma_to_t(sigma) 
-    # TODO try using the unet model instead of this
-    eps = model.get_eps(z, t, cond)
-    return eps
+def unet_multi_pass(model_wrap_cfg, z, sigmas, sigma_level, extra_args):
+    denoised_latent = z.clone().detach()
+    for i in range(sigma_level):
+        denoised_latent = unet_single_pass(model_wrap_cfg, denoised_latent, sigmas, extra_args=extra_args, sigma_level=i)
+    return denoised_latent
 
 def load_model_from_config(config, ckpt, vae_ckpt=None, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -80,41 +75,34 @@ def load_model_from_config(config, ckpt, vae_ckpt=None, verbose=False):
         print(u)
     return model
 
-def get_binary_mask(model, rm):
-    decoded_relevance_map = model.decode_first_stage(rm)
-    decoded_relevance_map = 255 * rearrange(decoded_relevance_map, "1 c h w -> h w c")
-
-    q1 = np.percentile(decoded_relevance_map.cpu(), 25)
-    q3 = np.percentile(decoded_relevance_map.cpu(), 75)
+def get_binary_mask(threshold, rm):
+    # IQR
+    q1 = np.percentile(rm.cpu(), 25)
+    q3 = np.percentile(rm.cpu(), 75)
     iqr = q3 - q1
-
     lower_bound = q1 - 1.5 * iqr
     upper_bound = q3 + 1.5 * iqr
+    # Clamp and normalize
+    clamped_rm = np.clip(rm.cpu(), lower_bound, upper_bound)
+    normalized_rm = (clamped_rm - torch.min(clamped_rm)) / (torch.max(clamped_rm) - torch.min(clamped_rm))
+    # Apply threshold
+    edit_mask = normalized_rm.clone().detach()
+    edit_mask[normalized_rm >= threshold] = 1.
+    edit_mask[normalized_rm < threshold] = 0.
 
-    clamped_relevance_map = np.clip(decoded_relevance_map.cpu(), lower_bound, upper_bound)
-
-    normalized_relevance_map = (
-        clamped_relevance_map - torch.min(clamped_relevance_map)
-        ) / (
-            torch.max(clamped_relevance_map) - torch.min(clamped_relevance_map)
-            )
-    edit_mask = normalized_relevance_map
-    edit_mask[normalized_relevance_map > 0.3] = 1.
-    edit_mask[normalized_relevance_map <= 0.3] = 0.
-    #edit_mask = edit_mask.to("cuda")
     return edit_mask
-
 
 def get_relevance_map(model_wrap_cfg, z, sigmas, sigma_level, extra_args, extra_args_no_text):
     denoised_latent = unet_single_pass(model_wrap_cfg, z, sigmas, extra_args=extra_args, sigma_level=sigma_level)
     predicted_noise = z - denoised_latent
     denoised_latent_no_text = unet_single_pass(model_wrap_cfg, z, sigmas, extra_args=extra_args_no_text, sigma_level=sigma_level)
     predicted_noise_no_text = z - denoised_latent_no_text
-
     relevance_map = torch.abs(predicted_noise - predicted_noise_no_text)
     return relevance_map
 
-
+def forward_process(z_0, noise, sigma_t):
+    noisy_latent = z_0 + noise * K.utils.append_dims(sigma_t, z_0.ndim)
+    return noisy_latent
 
 
 def main():
@@ -130,6 +118,8 @@ def main():
     parser.add_argument("--edit", default="", required=False, type=str)
     parser.add_argument("--cfg-text", default=7.5, type=float)
     parser.add_argument("--cfg-image", default=1.5, type=float)
+    parser.add_argument("--threshold", default=0.0, type=float)
+    parser.add_argument("--cutoff", default=0.8, type=float)
     parser.add_argument("--seed", type=int)
     args = parser.parse_args()
 
@@ -151,36 +141,18 @@ def main():
     height = int((height * factor) // 64) * 64
     input_image = ImageOps.fit(input_image, (width, height), method=Image.Resampling.LANCZOS)
 
-    # # Noisy image
-    # noisy_image = Image.open(args.noisy).convert("RGB")
-    # width, height = noisy_image.size
-    # factor = args.resolution / max(width, height)
-    # factor = math.ceil(min(width, height) * factor / 64) * 64 / min(width, height)
-    # width = int((width * factor) // 64) * 64
-    # height = int((height * factor) // 64) * 64
-    # noisy_image = ImageOps.fit(noisy_image, (width, height), method=Image.Resampling.LANCZOS)
-
     with torch.no_grad(), autocast("cuda"), model.ema_scope(): # .ema_scope() makes it so that the model is run with the EMA params
         cond = {}
         cond["c_crossattn"] = [model.get_learned_conditioning([args.edit])]
         input_image = 2 * torch.tensor(np.array(input_image)).float() / 255 - 1
         input_image = rearrange(input_image, "h w c -> 1 c h w").to(model.device)
 
-
         encoded_input_image = model.encode_first_stage(input_image).mode()
         cond["c_concat"] = [encoded_input_image]
-        # NOTE This is a DiagonalGaussianDistribution().mode(), which actually returns the mean...
-        # If we set z = cond["c_concat"] and skip from here to decode_first_stage(z), we get the same image but a bit disorted.
+
         uncond = {}
         uncond["c_crossattn"] = [null_token]
         uncond["c_concat"] = [torch.zeros_like(cond["c_concat"][0])]
-        # TODO Figure out what below line does
-        # model_wrap = K.external.CompVisDenoiser(model); model = ddpm_edit.LatentDiffusion
-        # CompVisDenoiser is a type of DiscreteEpsDDPMDenoiser, which is a type of DiscreteSchedule
-        # DiscreteSchedule: A mapping between continuous noise levels (sigmas) and a list of discrete noise levels
-        # .get_sigmas returns those sigmas. So I assume this has something to do with the noise schedule.
-        sigmas = model_wrap.get_sigmas(args.steps)
-        # TODO: Find out what do sigmas look like
 
         cond_no_text = {}
         cond_no_text["c_crossattn"] = [model.get_learned_conditioning([""])]
@@ -200,43 +172,24 @@ def main():
             "image_cfg_scale": args.cfg_image,
         }
 
+        # sigmas[0] is the max noise level, sigmas[-1] is min (0) noise
+        sigmas = model_wrap.get_sigmas(args.steps)
+
         torch.manual_seed(0)
 
-        # TODO Figure out how to get the actual noised image at step t, rather than giving an arbitrary amount of noise
-        sigma_level = 10 # NOTE small number means more noise
+        sigma_level = int(args.steps * (1 - args.cutoff))
+        print(sigma_level)
         noise = torch.randn_like(encoded_input_image)
-        noisy_latent = encoded_input_image + noise * K.utils.append_dims(sigmas[sigma_level], encoded_input_image.ndim)
-        # NOTE maybe we need to multiply with sigma[0] to sigma[20] or sigma[20] to sigma[100], instad of just multiplying with simga[20]
+        noisy_latent = forward_process(encoded_input_image, noise, sigmas[sigma_level])
 
-        # NOTE why multiply with sigmas[0]?
-        z = noisy_latent# * sigmas[0]
-        relevance_map = get_relevance_map(model_wrap_cfg, z, sigmas, 10, extra_args, extra_args_no_text)
-        edit_mask = get_binary_mask(model, relevance_map)
-        # TODO: Find out if/why edit mask is all 1 or all 0
-        edit_mask_channel_1 = edit_mask[:,:,0]
-        edit_mask_channel_2 = edit_mask[:,:,1]
-        edit_mask_channel_3 = edit_mask[:,:,2]
-        print(edit_mask_channel_1.shape)
-        print(edit_mask_channel_2.shape)
-        print(edit_mask_channel_3.shape)
-
-        # print(squashed_mask.shape)
-
-        # x = torch.clamp((edit_mask + 1.0) / 2.0, min=0.0, max=1.0)
-        # x = 255.0 * rearrange(edit_mask, "1 c h w -> h w c")
-        # x = Image.fromarray(edit_mask.type(torch.uint8).cpu().numpy())
-        # TODO try doing this before decoding again, check pixel values after decode
-        img1 = Image.fromarray(255*np.uint8(edit_mask_channel_1), 'L')
-        img2 = Image.fromarray(255*np.uint8(edit_mask_channel_2), 'L')
-        img3 = Image.fromarray(255*np.uint8(edit_mask_channel_3), 'L')
-
-        img1.save("relevance_maps/normalized_single_pass/decoded_before_iqr_binary_1.png")
-        img2.save("relevance_maps/normalized_single_pass/decoded_before_iqr_binary_2.png")
-        img3.save("relevance_maps/normalized_single_pass/decoded_before_iqr_binary_3.png")
+        relevance_map = get_relevance_map(model_wrap_cfg, noisy_latent, sigmas, sigma_level, extra_args, extra_args_no_text)
+        edit_mask = get_binary_mask(args.threshold, relevance_map).to("cuda")
 
         # Denoising stage
-        z = noise
-        z = K.sampling.sample_euler_ancestral(model_wrap_cfg, z, sigmas, extra_args=extra_args, mask=edit_mask, z_0=encoded_input_image)
+        z = torch.randn_like(encoded_input_image)
+        z = K.sampling.sample_euler_ancestral(model_wrap_cfg, z, sigmas[:sigma_level], extra_args=extra_args)
+        z = z * edit_mask + noisy_latent * (1 - edit_mask)
+        z = K.sampling.sample_euler_ancestral(model_wrap_cfg, z, sigmas[sigma_level:], extra_args=extra_args)
 
         x = model.decode_first_stage(z)
 
