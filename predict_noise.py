@@ -18,6 +18,8 @@ from torch import autocast
 sys.path.append("./stable_diffusion")
 
 from stable_diffusion.ldm.util import instantiate_from_config
+from wys.relevance_map import RelevanceMap
+from wys.denoise import masked_denoiser
 
 
 class CFGDenoiser(nn.Module):
@@ -36,21 +38,6 @@ class CFGDenoiser(nn.Module):
         out_cond, out_img_cond, out_uncond = self.inner_model(cfg_z, cfg_sigma, cond=cfg_cond).chunk(3)
         return out_uncond + text_cfg_scale * (out_cond - out_img_cond) + image_cfg_scale * (out_img_cond - out_uncond)
 
-
-@torch.no_grad()
-def unet_single_pass(model, x, sigmas, extra_args=None, sigma_level=None):
-    """
-    """
-    extra_args = {} if extra_args is None else extra_args
-    s_in = x.new_ones([x.shape[0]])
-    denoised = model(x, sigmas[sigma_level] * s_in, **extra_args)  # mask unaware prediction
-    return denoised
-
-def unet_multi_pass(model_wrap_cfg, z, sigmas, sigma_level, extra_args):
-    denoised_latent = z.clone().detach()
-    for i in range(sigma_level):
-        denoised_latent = unet_single_pass(model_wrap_cfg, denoised_latent, sigmas, extra_args=extra_args, sigma_level=i)
-    return denoised_latent
 
 def load_model_from_config(config, ckpt, vae_ckpt=None, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -74,35 +61,6 @@ def load_model_from_config(config, ckpt, vae_ckpt=None, verbose=False):
         print("unexpected keys:")
         print(u)
     return model
-
-def get_binary_mask(threshold, rm):
-    # IQR
-    q1 = np.percentile(rm.cpu(), 25)
-    q3 = np.percentile(rm.cpu(), 75)
-    iqr = q3 - q1
-    lower_bound = q1 - 1.5 * iqr
-    upper_bound = q3 + 1.5 * iqr
-    # Clamp and normalize
-    clamped_rm = np.clip(rm.cpu(), lower_bound, upper_bound)
-    normalized_rm = (clamped_rm - torch.min(clamped_rm)) / (torch.max(clamped_rm) - torch.min(clamped_rm))
-    # Apply threshold
-    edit_mask = normalized_rm.clone().detach()
-    edit_mask[normalized_rm >= threshold] = 1.
-    edit_mask[normalized_rm < threshold] = 0.
-
-    return edit_mask
-
-def get_relevance_map(model_wrap_cfg, z, sigmas, sigma_level, extra_args, extra_args_no_text):
-    denoised_latent = unet_single_pass(model_wrap_cfg, z, sigmas, extra_args=extra_args, sigma_level=sigma_level)
-    predicted_noise = z - denoised_latent
-    denoised_latent_no_text = unet_single_pass(model_wrap_cfg, z, sigmas, extra_args=extra_args_no_text, sigma_level=sigma_level)
-    predicted_noise_no_text = z - denoised_latent_no_text
-    relevance_map = torch.abs(predicted_noise - predicted_noise_no_text)
-    return relevance_map
-
-def forward_process(z_0, noise, sigma_t):
-    noisy_latent = z_0 + noise * K.utils.append_dims(sigma_t, z_0.ndim)
-    return noisy_latent
 
 
 def main():
@@ -165,31 +123,35 @@ def main():
             "image_cfg_scale": args.cfg_image,
         }
 
-        extra_args_no_text = {
-            "cond": cond_no_text,
-            "uncond": uncond,
-            "text_cfg_scale": args.cfg_text,
-            "image_cfg_scale": args.cfg_image,
-        }
-
         # sigmas[0] is the max noise level, sigmas[-1] is min (0) noise
         sigmas = model_wrap.get_sigmas(args.steps)
 
         torch.manual_seed(0)
 
         sigma_level = int(args.steps * (1 - args.cutoff))
-        print(sigma_level)
-        noise = torch.randn_like(encoded_input_image)
-        noisy_latent = forward_process(encoded_input_image, noise, sigmas[sigma_level])
 
-        relevance_map = get_relevance_map(model_wrap_cfg, noisy_latent, sigmas, sigma_level, extra_args, extra_args_no_text)
-        edit_mask = get_binary_mask(args.threshold, relevance_map).to("cuda")
+        # Build the noisy latent, relevance map and the edit mask
+        rm = RelevanceMap(
+            denoiser_model=model_wrap_cfg,
+            device=model.device,
+            z_0=encoded_input_image,
+            sigmas=sigmas,
+            t=sigma_level,
+            extra_args=extra_args,
+            threshold=args.threshold
+        )
+        edit_mask = rm.edit_mask
+        z_t = rm.z_t  # Noisy latent used for creating the relevance map
 
         # Denoising stage
-        z = torch.randn_like(encoded_input_image)
-        z = K.sampling.sample_euler_ancestral(model_wrap_cfg, z, sigmas[:sigma_level], extra_args=extra_args)
-        z = z * edit_mask + noisy_latent * (1 - edit_mask)
-        z = K.sampling.sample_euler_ancestral(model_wrap_cfg, z, sigmas[sigma_level:], extra_args=extra_args)
+        z = masked_denoiser(
+            denoiser_model=model_wrap_cfg,
+            edit_mask=edit_mask,
+            sigmas=sigmas,
+            z_t=z_t, # Need to use the same noisy latent for editing with the mask
+            t=sigma_level,
+            extra_args=extra_args
+        )
 
         x = model.decode_first_stage(z)
 

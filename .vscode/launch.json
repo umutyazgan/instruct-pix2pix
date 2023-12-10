@@ -35,7 +35,7 @@
                 // "--noisy",
                 // "../examples/noisy_encoded_image.pth",
                 "--output",
-                "pelin-b-sigma-1.jpg",
+                "pelin-b.jpg",
                 "--edit",
                 "Make her hair blue",
                 "--steps",
