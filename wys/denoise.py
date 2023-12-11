@@ -22,7 +22,10 @@ def masked_denoiser(
     :return: Latent denoised with the edit mask and (un)conditioning. (torch.Tensor)
     """
     z = torch.randn_like(edit_mask)
-    z = K.sampling.sample_euler_ancestral(denoiser_model, z, sigmas[:t], extra_args=extra_args)
+    # print(t)
+    # print(sigmas[t])
+
+    z = K.sampling.sample_euler_ancestral(denoiser_model, z, sigmas[:t+2], extra_args=extra_args)
     z = z * edit_mask + z_t * (1 - edit_mask)
-    z = K.sampling.sample_euler_ancestral(denoiser_model, z, sigmas[t:], extra_args=extra_args)
+    z = K.sampling.sample_euler_ancestral(denoiser_model, z, sigmas[t+1:], extra_args=extra_args)
     return z

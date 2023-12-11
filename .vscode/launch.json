@@ -37,15 +37,15 @@
                 "--output",
                 "pelin-b.jpg",
                 "--edit",
-                "Make her hair blue",
+                "Make her eyes blue",
                 "--steps",
                 "100",
                 "--threshold",
-                "0.4",
+                "0.5",
                 "--cutoff",
-                "0.7",
-                // "--cfg-image",
-                // "2.0"
+                "0.8",
+                "--cfg-image",
+                "2.0"
             ],
             "console": "integratedTerminal",
             "justMyCode": false

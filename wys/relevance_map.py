@@ -40,14 +40,14 @@ class RelevanceMap:
         cond_no_text = dict(self.extra_args["cond"])
         # Assuming extra_args["uncond"]["c_crossattn"] == [null_token], meaning conditioned on
         # empty string.
-        cond_no_text["c_crossattn"] = self.extra_args["uncond"]["c_crossattn"]
-        cond_no_text["c_concat"] = [z_0]
+        cond_no_text["c_crossattn"] = list(self.extra_args["uncond"]["c_crossattn"])
+        cond_no_text["c_concat"] = list(self.extra_args["cond"]["c_concat"])
 
         self.extra_args_no_text = {
             "cond": cond_no_text,
-            "uncond": self.extra_args["uncond"],
-            "text_cfg_scale": self.extra_args["text_cfg_scale"],
-            "image_cfg_scale": self.extra_args["image_cfg_scale"],
+            "uncond": dict(self.extra_args["uncond"]),
+            "text_cfg_scale": float(self.extra_args["text_cfg_scale"]),
+            "image_cfg_scale": float(self.extra_args["image_cfg_scale"]),
         }
 
         self.relevance_map = self.generate_relevance_map()
